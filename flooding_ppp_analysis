@@ -1,0 +1,413 @@
+################################################################################
+# Poisson Point Process Analysis of Flooding in Providence, RI
+# Analysis of self-reported flood locations with rainfall intensity covariate
+################################################################################
+
+# Load required libraries
+library(spatstat)      # Spatial point pattern analysis
+library(sf)            # Spatial features
+library(spatstat.geom) # Spatial geometries for spatstat
+library(terra)         # Raster data manipulation
+library(ggplot2)       # Plotting
+library(dplyr)         # Data manipulation
+library(tidyr)         # Data tidying
+library(viridis)       # Color palettes
+
+# Set working directory (adjust as needed)
+setwd("ADD PATH")
+
+################################################################################
+# 1. DATA LOADING AND PREPARATION
+################################################################################
+
+cat("Loading flood data...\n")
+# Load flood event data
+#FOR HOURLY
+#flood_data <- read.csv("No90_flood_weather_combined.csv")
+flood_data <- read.csv("rain_myCoast_24h_1h.csv")
+
+#FOR 48 HOUR
+#flood_data <- read.csv("rain_48_ppp.csv")
+#flood_data <- read.csv("rain_myCoast_48.csv")
+
+# Summary of the data
+cat("\nFlood Data Summary:\n")
+print(summary(flood_data))
+cat("\nNumber of flood reports:", nrow(flood_data), "\n")
+
+# Check for missing values
+cat("\nMissing values:\n")
+print(colSums(is.na(flood_data)))
+
+# Load Providence boundary shapefile
+cat("\nLoading Providence boundary shapefile...\n")
+pvd_boundary_sf <- st_read("PVD_Boundary.shp")
+
+# Check the CRS
+cat("\nOriginal CRS of boundary:\n")
+print(st_crs(pvd_boundary_sf))
+
+# Set CRS if missing (NAD 1983 State Plane Rhode Island FIPS 3800 in feet)
+# EPSG code: 3438
+if (is.na(st_crs(pvd_boundary_sf))) {
+  cat("\nCRS is missing. Setting to NAD 1983 State Plane Rhode Island (EPSG:3438)...\n")
+  st_crs(pvd_boundary_sf) <- 3438
+}
+
+cat("\nBoundary CRS set to:\n")
+print(st_crs(pvd_boundary_sf))
+
+# Convert to spatstat owin object (keep in projected coordinates)
+pvd_window <- as.owin(pvd_boundary_sf)
+
+cat("\nProvidence boundary window created\n")
+cat("Window area:", spatstat.geom::area.owin(pvd_window), "square feet\n")
+
+# Transform flood points from WGS84 (lat/lon) to match boundary projection
+cat("\nTransforming flood coordinates to match boundary projection...\n")
+flood_points_sf <- st_as_sf(flood_data, 
+                             coords = c("longitude", "latitude"),
+                             crs = 4326)  # WGS84 lat/lon
+
+# Transform to State Plane Rhode Island
+flood_points_projected <- st_transform(flood_points_sf, crs = st_crs(pvd_boundary_sf))
+
+# Extract coordinates in projected system
+flood_coords <- st_coordinates(flood_points_projected)
+
+################################################################################
+# 2. CREATE POINT PATTERN OBJECT
+################################################################################
+
+cat("\n" , rep("=", 80), "\n", sep="")
+cat("Creating spatial point pattern...\n")
+
+# Create point pattern with marks (rainfall intensity) using projected coordinates
+flood_ppp <- ppp(
+  x = flood_coords[, "X"],
+  y = flood_coords[, "Y"],
+  window = pvd_window,
+#  marks = flood_data$rainfall_48h_mm #for 48
+  marks = flood_data$rainfall_1h_mm
+#  marks = flood_data$rain
+
+)
+
+# Create unmarked version for analyses that don't support marks
+flood_ppp_unmarked <- unmark(flood_ppp)
+
+# Summary of point pattern
+cat("\nPoint pattern summary:\n")
+print(summary(flood_ppp_unmarked))
+
+# Check intensity (points per unit area - now in square feet)
+cat("\nOverall intensity:", intensity(flood_ppp_unmarked), "floods per square foot\n")
+cat("Or approximately:", intensity(flood_ppp_unmarked) * 5280^2, "floods per square mile\n")
+
+################################################################################
+# 3. EXPLORATORY SPATIAL ANALYSIS
+################################################################################
+
+cat("\n", rep("=", 80), "\n", sep="")
+cat("Performing exploratory spatial analysis...\n")
+
+# Basic quadrat count test for CSR (Complete Spatial Randomness)
+cat("\nQuadrat test for Complete Spatial Randomness:\n")
+qt <- quadrat.test(flood_ppp_unmarked, nx = 4, ny = 4)
+print(qt)
+
+# Kernel density estimation
+cat("\nComputing kernel density estimation...\n")
+flood_density <- density(flood_ppp_unmarked, sigma = bw.diggle)
+
+# Ripley's K-function to test for clustering
+cat("\nComputing Ripley's K-function...\n")
+k_result <- Kest(flood_ppp_unmarked, correction = "border")
+
+# L-function (variance-stabilized K)
+l_result <- Lest(flood_ppp_unmarked, correction = "border")
+
+# Pair correlation function
+cat("\nComputing pair correlation function...\n")
+pcf_result <- pcf(flood_ppp, correction = "best")
+
+################################################################################
+# 4. POISSON POINT PROCESS MODEL WITH RAINFALL COVARIATE
+################################################################################
+
+cat("\n", rep("=", 80), "\n", sep="")
+cat("Fitting Poisson point process models...\n")
+
+# Create unmarked point pattern for ppm (marks not supported in ppm except for multitype)
+flood_ppp_unmarked <- unmark(flood_ppp)
+
+# Model 1: Homogeneous Poisson process (constant intensity)
+cat("\nModel 1: Homogeneous Poisson Process\n")
+model_homog <- ppm(flood_ppp_unmarked ~ 1)
+print(summary(model_homog))
+
+# Model 2: Inhomogeneous Poisson process with rainfall covariate
+cat("\nModel 2: Inhomogeneous Poisson Process with Rainfall\n")
+
+# Create a spatial covariate from rainfall intensity
+# Use kernel smoothing to create a continuous rainfall intensity surface
+cat("Creating smoothed rainfall intensity surface...\n")
+rainfall_im <- Smooth(flood_ppp, sigma = bw.diggle)
+
+# Fit model with rainfall as covariate
+model_rainfall <- ppm(flood_ppp_unmarked ~ rainfall_im)
+print(summary(model_rainfall))
+
+cat("\nModel coefficients:\n")
+print(coef(model_rainfall))
+
+# Exponential of coefficient gives multiplicative effect
+cat("\nMultiplicative effect of rainfall on flood intensity:\n")
+cat("For each unit increase in rainfall, intensity multiplies by:", 
+    exp(coef(model_rainfall)[2]), "\n")
+
+# Model 3: Polynomial effect of rainfall
+cat("\nModel 3: Poisson Process with Polynomial Rainfall Effect\n")
+model_rainfall_poly <- ppm(flood_ppp_unmarked ~ polynom(rainfall_im, 2))
+print(summary(model_rainfall_poly))
+
+################################################################################
+# 5. MODEL COMPARISON AND DIAGNOSTICS
+################################################################################
+
+cat("\n", rep("=", 80), "\n", sep="")
+cat("Model comparison and diagnostics...\n")
+
+# AIC comparison
+cat("\nAIC comparison:\n")
+aic_values <- data.frame(
+  Model = c("Homogeneous", "Rainfall Linear", "Rainfall Polynomial"),
+  AIC = c(AIC(model_homog), AIC(model_rainfall), AIC(model_rainfall_poly))
+)
+print(aic_values)
+
+cat("\nBest model (lowest AIC):", 
+    aic_values$Model[which.min(aic_values$AIC)], "\n")
+
+# Likelihood ratio test
+cat("\nLikelihood ratio test (Homogeneous vs Rainfall):\n")
+lr_test <- anova(model_homog, model_rainfall, test = "LRT")
+print(lr_test)
+
+# Residual diagnostics for best model (rainfall model)
+cat("\nComputing residuals for rainfall model...\n")
+residuals_rainfall <- diagnose.ppm(model_rainfall, which = "smooth")
+
+# Lurking variable plot
+cat("\nLurking variable analysis...\n")
+lurking_result <- lurking(model_rainfall, covariate = rainfall_im, 
+                          type = "raw", cumulative = TRUE)
+
+################################################################################
+# 6. PREDICTION AND RISK MAPPING
+################################################################################
+
+cat("\n", rep("=", 80), "\n", sep="")
+cat("Generating predictions and risk maps...\n")
+
+# Predict intensity across Providence
+predicted_intensity <- predict(model_rainfall, se = TRUE)
+
+cat("\nPrediction summary:\n")
+print(summary(predicted_intensity$estimate))
+
+################################################################################
+# 7. VISUALIZATION
+################################################################################
+
+cat("\n", rep("=", 80), "\n", sep="")
+cat("Creating visualizations...\n")
+
+# Create output directory
+output_dir <- "ADD PATH"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Set up PDF output
+pdf(file.path(output_dir, "PPP_analysis_1.pdf"), width = 12, height = 10)
+
+# Plot 1: Point pattern with rainfall marks
+par(mfrow = c(2, 2), mar = c(4, 4, 3, 2))
+plot(flood_ppp_unmarked, main = "Flood Reports in Providence, RI", 
+     pch = 16, col = "darkblue", cex = 0.8)
+
+# Plot 2: Kernel density
+plot(flood_density, main = "Kernel Density of Flood Events",
+     ribbon = TRUE)
+points(flood_ppp_unmarked, pch = 16, cex = 0.5, col = "white")
+
+# Plot 3: Rainfall intensity surface
+plot(rainfall_im, main = "Smoothed Rainfall Intensity Surface",
+     ribbon = TRUE)
+points(flood_ppp_unmarked, pch = 16, cex = 0.5, col = "white")
+
+# Plot 4: Predicted intensity from rainfall model
+plot(predicted_intensity$estimate, main = "Predicted Flood Intensity",
+     ribbon = TRUE)
+points(flood_ppp_unmarked, pch = 16, cex = 0.5, col = "white")
+
+# New page for diagnostic plots
+par(mfrow = c(2, 2), mar = c(4, 4, 3, 2))
+
+# Plot 5: Ripley's K-function
+plot(k_result, main = "Ripley's K-function", 
+     legend = FALSE, lwd = 2)
+legend("topleft", c("Observed", "Theoretical CSR"), 
+       lty = 1:2, lwd = 2, col = 1:2)
+
+# Plot 6: L-function
+plot(l_result, main = "L-function (Variance Stabilized)",
+     legend = FALSE, lwd = 2)
+legend("topleft", c("Observed", "Theoretical CSR"), 
+       lty = 1:2, lwd = 2, col = 1:2)
+
+# Plot 7: Pair correlation function
+plot(pcf_result, main = "Pair Correlation Function",
+     legend = FALSE, lwd = 2)
+legend("topright", c("Observed", "Theoretical CSR"), 
+       lty = 1:2, lwd = 2, col = 1:2)
+
+# Plot 8: Quadrat count
+plot(qt, main = "Quadrat Test for CSR")
+
+# New page for model diagnostics
+par(mfrow = c(2, 2), mar = c(4, 4, 3, 2))
+
+# Plot residuals
+plot(residuals_rainfall, main = "Smoothed Residuals - Rainfall Model")
+
+# Lurking variable plot
+plot(lurking_result, main = "Lurking Variable Plot")
+
+# Predicted vs observed intensity
+par(mfrow = c(1, 2), mar = c(4, 4, 3, 2))
+plot(predicted_intensity$estimate, main = "Predicted Intensity")
+plot(predicted_intensity$se, main = "Standard Error of Prediction")
+
+dev.off()
+
+cat("\nPlots saved to:", file.path(output_dir, "PPP_floodAnalysis_1.pdf"), "\n")
+
+################################################################################
+# 8. SUMMARY STATISTICS AND RESULTS EXPORT
+################################################################################
+
+cat("\n", rep("=", 80), "\n", sep="")
+cat("Generating summary report...\n")
+
+# Create summary statistics
+summary_stats <- data.frame(
+  Metric = c(
+    "Total flood reports",
+    "Study area (sq feet)",
+    "Study area (sq miles)",
+    "Overall intensity (floods/sq foot)",
+    "Overall intensity (floods/sq mile)",
+    "Mean rainfall (mm)",
+    "Median rainfall (mm)",
+    "Max rainfall (mm)",
+    "Quadrat test p-value",
+    "Best model",
+    "Rainfall coefficient",
+    "Rainfall effect (multiplicative)"
+  ),
+  Value = c(
+    nrow(flood_data),
+    round(spatstat.geom::area.owin(pvd_window), 2),
+    round(spatstat.geom::area.owin(pvd_window) / (5280^2), 4),
+    format(intensity(flood_ppp_unmarked), scientific = TRUE, digits = 3),
+    round(intensity(flood_ppp_unmarked) * 5280^2, 4),
+    round(mean(flood_data$rainfall_1h_mm), 2),
+    round(median(flood_data$rainfall_1h_mm), 2),
+    round(max(flood_data$rainfall_1h_mm), 2),
+    round(qt$p.value, 4),
+    aic_values$Model[which.min(aic_values$AIC)],
+    round(coef(model_rainfall)[2], 4),
+    round(exp(coef(model_rainfall)[2]), 4)
+  )
+)
+
+write.csv(summary_stats, 
+          file.path(output_dir, "PPP_analysisSummary_1.csv"),
+          row.names = FALSE)
+
+# Export model coefficients
+model_coefs <- data.frame(
+  Model = rep(c("Homogeneous", "Rainfall", "Rainfall_Poly"), 
+              c(1, 2, 3)),
+  Coefficient = c(
+    names(coef(model_homog)),
+    names(coef(model_rainfall)),
+    names(coef(model_rainfall_poly))
+  ),
+  Estimate = c(
+    coef(model_homog),
+    coef(model_rainfall),
+    coef(model_rainfall_poly)
+  ),
+  AIC = c(
+    rep(AIC(model_homog), 1),
+    rep(AIC(model_rainfall), 2),
+    rep(AIC(model_rainfall_poly), 3)
+  )
+)
+
+write.csv(model_coefs,
+          file.path(output_dir, "model_coefficients_1.csv"),
+          row.names = FALSE)
+
+# Export predicted intensity as raster for GIS
+predicted_raster <- rast(predicted_intensity$estimate)
+writeRaster(predicted_raster, 
+            file.path(output_dir, "predicted_flood_intensity_1.tif"),
+            overwrite = TRUE)
+
+################################################################################
+# 9. INTERPRETATION AND CONCLUSIONS
+################################################################################
+
+cat("\n", rep("=", 80), "\n", sep="")
+cat("ANALYSIS COMPLETE - KEY FINDINGS:\n")
+cat(rep("=", 80), "\n", sep="")
+
+cat("\n1. SPATIAL PATTERN:\n")
+if (qt$p.value < 0.05) {
+  cat("   - Flood events show significant departure from Complete Spatial Randomness\n")
+  cat("   - Events are NOT randomly distributed across Providence\n")
+} else {
+  cat("   - Flood events do not significantly depart from random distribution\n")
+}
+
+cat("\n2. CLUSTERING:\n")
+cat("   - Check K-function and pair correlation plots in the PDF\n")
+cat("   - Values above theoretical line indicate clustering\n")
+
+cat("\n3. RAINFALL EFFECT:\n")
+cat("   - Rainfall has a", 
+    ifelse(coef(model_rainfall)[2] > 0, "positive", "negative"),
+    "effect on flood intensity\n")
+cat("   - For each 1mm increase in rainfall, flood intensity multiplies by:",
+    round(exp(coef(model_rainfall)[2]), 3), "\n")
+cat("   - Rainfall", 
+    ifelse(aic_values$AIC[2] < aic_values$AIC[1], "significantly", "does not significantly"),
+    "improves model fit\n")
+
+cat("\n4. MODEL SELECTION:\n")
+cat("   - Best model:", aic_values$Model[which.min(aic_values$AIC)], "\n")
+cat("   - This model provides the best balance of fit and complexity\n")
+
+cat("\n5. OUTPUTS GENERATED:\n")
+cat("   - providence_flood_analysis.pdf (visualizations)\n")
+cat("   - flood_analysis_summary.csv (summary statistics)\n")
+cat("   - model_coefficients.csv (model parameters)\n")
+cat("   - predicted_flood_intensity.tif (GIS raster)\n")
+
+cat("\n", rep("=", 80), "\n", sep="")
+cat("Analysis script completed successfully!\n")
+cat("All outputs saved to:", output_dir, "\n")
+cat(rep("=", 80), "\n\n", sep="")
+
