@@ -1,0 +1,314 @@
+# =============================================================================
+# gwr_analysis.R
+#
+# Geographically Weighted Regression (GWR) predicting flooding_present from
+# hourly_rainfall_mm and daily_rainfall_mm, using photo locations clipped to
+# the Providence boundary.
+#
+# WORKFLOW:
+#   1. Load & spatial-join data to PVD boundary
+#   2. Diagnostic tests (OLS baseline, multicollinearity, spatial autocorrelation)
+#   3. Bandwidth selection
+#   4. GWR model
+#   5. Map local R², coefficients, and residuals
+#
+# Dependencies:
+#   install.packages(c("sf", "spdep", "spgwr", "ggplot2", "dplyr",
+#                      "readr", "car", "lmtest", "RColorBrewer", "gridExtra"))
+# =============================================================================
+
+library(sf)
+library(spdep)
+library(spgwr)
+library(ggplot2)
+library(dplyr)
+library(readr)
+library(car)
+library(lmtest)
+library(RColorBrewer)
+library(gridExtra)
+
+# ── Paths ─────────────────────────────────────────────────────────────────────
+csv_path <- "rain_GWR.csv"
+boundary_path <- "PVD_Boundary.shp"
+output_dir    <- "."   # change if needed
+
+cat("=======================================================\n")
+cat(" GWR Analysis: Flooding ~ Rainfall\n")
+cat("=======================================================\n\n")
+
+# =============================================================================
+# 1. LOAD AND PREPARE DATA
+# =============================================================================
+cat("── 1. Loading data ──────────────────────────────────\n")
+
+#FOR 24 HOUR
+#df <- read_csv(csv_path, show_col_types = FALSE) |>
+ # filter(!is.na(rainfall_1h_mm), !is.na(rainfall_24h_mm),
+ #        !is.na(flooding_present))
+
+#USE THIS ONE
+df <- read_csv(csv_path, show_col_types = FALSE) |>
+  filter(!is.na(rainfall_1h_mm),
+         !is.na(flooding_present))
+
+# Convert to sf (WGS84)
+pts_wgs <- st_as_sf(df, coords = c("longitude", "latitude"), crs = 4326)
+
+# Load PVD boundary and reproject both to a projected CRS (EPSG:26919 = UTM zone 19N)
+pvd <- st_read(boundary_path, quiet = TRUE)
+st_crs(pvd) <- 3438          # assign missing CRS: RI State Plane feet
+pvd <- st_transform(pvd, 26919)
+pts <- st_transform(pts_wgs, 26919)
+
+cat(sprintf("  Total points loaded:  %d\n", nrow(pts)))
+
+# Clip points to PVD boundary
+pts_pvd <- st_filter(pts, pvd)
+cat(sprintf("  Points inside PVD:    %d\n\n", nrow(pts_pvd)))
+
+if (nrow(pts_pvd) < 30) {
+  cat("WARNING: fewer than 30 points inside PVD boundary.\n")
+  cat("         Using all points for GWR instead.\n\n")
+  pts_pvd <- pts
+}
+
+# Extract coordinates for GWR
+coords <- st_coordinates(pts_pvd)
+pts_pvd$X <- coords[, 1]
+pts_pvd$Y <- coords[, 2]
+
+# =============================================================================
+# 2. DIAGNOSTICS — OLS BASELINE
+# =============================================================================
+cat("── 2. OLS Baseline & Diagnostics ───────────────────\n")
+
+#FOR 24 HOUR
+#ols <- lm(flooding_present ~ rainfall_1h_mm + rainfall_24h_mm,
+#          data = pts_pvd)
+
+#USE THIS ONE
+ols <- lm(flooding_present ~ rainfall_1h_mm,
+          data = pts_pvd)
+
+cat("\n[OLS Summary]\n")
+print(summary(ols))
+
+# --- 2a. Multicollinearity (VIF) ---------------------------------------------
+cat("\n[Variance Inflation Factors]\n")
+vif_vals <- vif(ols)
+print(vif_vals)
+if (any(vif_vals > 10)) {
+  cat("  WARNING: VIF > 10 detected — severe multicollinearity.\n")
+} else if (any(vif_vals > 5)) {
+  cat("  CAUTION: VIF > 5 detected — moderate multicollinearity.\n")
+} else {
+  cat("  VIF OK: no problematic multicollinearity.\n")
+}
+
+# --- 2b. Breusch-Pagan heteroscedasticity test --------------------------------
+cat("\n[Breusch-Pagan Test for Heteroscedasticity]\n")
+bp <- bptest(ols)
+print(bp)
+if (bp$p.value < 0.05) {
+  cat("  Heteroscedasticity detected (p < 0.05) — supports case for GWR.\n")
+} else {
+  cat("  No significant heteroscedasticity (p >= 0.05).\n")
+}
+
+# --- 2c. Moran's I on OLS residuals ------------------------------------------
+cat("\n[Moran's I on OLS Residuals]\n")
+nb        <- knn2nb(knearneigh(coords, k = 5))
+lw        <- nb2listw(nb, style = "W")
+moran_res <- moran.test(residuals(ols), lw)
+print(moran_res)
+if (moran_res$p.value < 0.05) {
+  cat("  Spatial autocorrelation in residuals detected — GWR is appropriate.\n")
+} else {
+  cat("  No significant spatial autocorrelation in residuals.\n")
+  cat("  GWR can still be informative for exploring spatial heterogeneity.\n")
+}
+
+# --- 2d. Save diagnostic plots ------------------------------------------------
+diag_path <- file.path(output_dir, "ols_diagnostics_421.png")
+png(diag_path, width = 1200, height = 900, res = 120)
+par(mfrow = c(2, 2))
+plot(ols, main = "")
+dev.off()
+cat(sprintf("\n  OLS diagnostic plots saved to: %s\n\n", diag_path))
+
+# =============================================================================
+# 3. BANDWIDTH SELECTION
+# =============================================================================
+cat("-- 3. Bandwidth Selection (fixed distance, CV)
+")
+cat("  This may take a moment...\n")
+
+# spgwr uses gwr.sel() for bandwidth (not bw.gwr), returns fixed distance in metres
+bw <- gwr.sel(
+  flooding_present ~ rainfall_1h_mm + rainfall_24h_mm,
+  #flooding_present ~ rainfall_1h_mm,
+  data    = as(pts_pvd, "Spatial"),
+  method  = "cv",           # cross-validation
+  gweight = gwr.bisquare,   # bisquare kernel
+  verbose = TRUE
+)
+
+cat(sprintf("  Optimal bandwidth: %.1f metres\n\n", bw))
+
+# =============================================================================
+# 4. FIT GWR MODEL
+# =============================================================================
+cat("-- 4. Fitting GWR Model\n")
+
+# spgwr::gwr() passes the kernel via gweight, not kernel= or adaptive=
+gwr_model <- gwr(
+  flooding_present ~ rainfall_1h_mm + rainfall_24h_mm,
+  #flooding_present ~ rainfall_1h_mm,
+  data      = as(pts_pvd, "Spatial"),
+  bandwidth = bw,
+  gweight   = gwr.bisquare,  # bisquare kernel function
+  hatmatrix = TRUE,
+  se.fit    = TRUE
+)
+
+cat("\n[GWR Summary]\n")
+print(gwr_model)
+
+# Extract results into a tidy data frame
+gwr_df <- as.data.frame(gwr_model$SDF) |>
+  mutate(
+    X              = pts_pvd$X,
+    Y              = pts_pvd$Y,
+    flooding_obs   = pts_pvd$flooding_present,
+    localR2        = gwr_model$SDF$localR2,
+    resid          = gwr_model$SDF$gwr.e,
+    coef_hourly    = gwr_model$SDF$rainfall_1h_mm,
+    coef_daily     = gwr_model$SDF$rainfall_24h_mm,
+    #coef_1     = gwr_model$SDF$rainfall_1h_mm,
+    coef_intercept = gwr_model$SDF$`(Intercept)`
+  )
+
+# =============================================================================
+# 5. SPATIAL AUTOCORRELATION ON GWR RESIDUALS
+# =============================================================================
+cat("\n── 5. Moran's I on GWR Residuals ────────────────────\n")
+moran_gwr <- moran.test(gwr_df$resid, lw)
+print(moran_gwr)
+if (moran_gwr$p.value < 0.05) {
+  cat("  Residual spatial autocorrelation remains — consider additional predictors.\n")
+} else {
+  cat("  GWR has accounted for spatial autocorrelation in residuals.\n")
+}
+
+# =============================================================================
+# 6. MAPS
+# =============================================================================
+cat("\n── 6. Saving output maps ────────────────────────────\n")
+
+pvd_outline <- st_transform(pvd, 26919)
+
+# Helper: base ggplot with PVD boundary
+base_map <- function(data, fill_var, title, low_col, high_col) {
+  ggplot() +
+    geom_sf(data = pvd_outline, fill = "grey95", colour = "grey50", linewidth = 0.4) +
+    geom_point(data = data,
+               aes(x = X, y = Y, fill = .data[[fill_var]]),
+               shape = 21, size = 2.5, colour = "white", stroke = 0.3) +
+    scale_fill_gradient2(low = low_col, mid = "lightyellow",
+                         high = high_col, midpoint = 0,
+                         name = fill_var) +
+    labs(title = title) +
+    theme_minimal(base_size = 11) +
+    theme(axis.text = element_blank(), axis.ticks = element_blank(),
+          panel.grid = element_blank())
+}
+
+# Map 1: Local R²
+p1 <- ggplot() +
+  geom_sf(data = pvd_outline, fill = "grey95", colour = "grey50", linewidth = 0.4) +
+  geom_point(data = gwr_df, aes(x = X, y = Y, fill = localR2),
+             shape = 21, size = 2.5, colour = "white", stroke = 0.3) +
+  scale_fill_distiller(palette = "YlOrRd", direction = 1, name = "Local R²") +
+  labs(title = "GWR Local R²") +
+  theme_minimal(base_size = 11) +
+  theme(axis.text = element_blank(), axis.ticks = element_blank(),
+        panel.grid = element_blank())
+
+# Map 2: Coefficient — hourly rainfall
+p2 <- ggplot() +
+  geom_sf(data = pvd_outline, fill = "grey95", colour = "grey50", linewidth = 0.4) +
+  geom_point(data = gwr_df, aes(x = X, y = Y, fill = coef_hourly),
+             shape = 21, size = 2.5, colour = "white", stroke = 0.3) +
+  scale_fill_gradient2(low = "#d73027", mid = "lightyellow", high = "#4575b4",
+                       midpoint = 0, name = "Coeff.") +
+  labs(title = "Local Coeff: Hourly Rainfall") +
+  theme_minimal(base_size = 11) +
+  theme(axis.text = element_blank(), axis.ticks = element_blank(),
+        panel.grid = element_blank())
+
+# Map 3: Coefficient — daily rainfall
+p3 <- ggplot() +
+  geom_sf(data = pvd_outline, fill = "grey95", colour = "grey50", linewidth = 0.4) +
+  geom_point(data = gwr_df, aes(x = X, y = Y, fill = coef_daily),
+             shape = 21, size = 2.5, colour = "white", stroke = 0.3) +
+  scale_fill_gradient2(low = "#d73027", mid = "lightyellow", high = "#4575b4",
+                       midpoint = 0, name = "Coeff.") +
+  labs(title = "Local Coeff: Daily Rainfall") +
+  theme_minimal(base_size = 11) +
+  theme(axis.text = element_blank(), axis.ticks = element_blank(),
+        panel.grid = element_blank())
+
+# Map 4: GWR residuals
+p4 <- ggplot() +
+  geom_sf(data = pvd_outline, fill = "grey95", colour = "grey50", linewidth = 0.4) +
+  geom_point(data = gwr_df, aes(x = X, y = Y, fill = resid),
+             shape = 21, size = 2.5, colour = "white", stroke = 0.3) +
+  scale_fill_gradient2(low = "#d73027", mid = "lightyellow", high = "#4575b4",
+                       midpoint = 0, name = "Residual") +
+  labs(title = "GWR Residuals") +
+  theme_minimal(base_size = 11) +
+  theme(axis.text = element_blank(), axis.ticks = element_blank(),
+        panel.grid = element_blank())
+
+
+# Map 5: Coefficient — 48hour rainfall
+#p5 <- ggplot() +
+#  geom_sf(data = pvd_outline, fill = "grey95", colour = "grey50", linewidth = 0.4) +
+#  geom_point(data = gwr_df, aes(x = X, y = Y, fill = coef_1),
+#             shape = 21, size = 2.5, colour = "white", stroke = 0.3) +
+#  scale_fill_gradient2(low = "#d73027", mid = "lightyellow", high = "#4575b4",
+ #                      midpoint = 0, name = "Coeff.") +
+ # labs(title = "Local Coeff: 1hour Rainfall") +
+#  theme_minimal(base_size = 11) +
+#  theme(axis.text = element_blank(), axis.ticks = element_blank(),
+ #       panel.grid = element_blank())
+
+maps_path <- file.path(output_dir, "gwr_maps_421.png")
+png(maps_path, width = 1600, height = 1400, res = 140)
+grid.arrange(p1, p2, p3, p4, ncol = 2,
+             top = "Geographically Weighted Regression — Providence, RI")
+#grid.arrange(p1, p4, p5, ncol = 2,
+ #            top = "Geographically Weighted Regression — Providence, RI")
+dev.off()
+cat(sprintf("  Maps saved to: %s\n", maps_path))
+
+# =============================================================================
+# 7. SAVE GWR RESULTS CSV
+# =============================================================================
+results_path <- file.path(output_dir, "gwr_241results.csv")
+gwr_df |>
+  select(X, Y, flooding_obs, coef_intercept, coef_hourly, coef_daily,
+         localR2, resid) |>
+  write_csv(results_path)
+
+#gwr_df |>
+ # select(X, Y, flooding_obs, coef_intercept, coef_1,
+ #        localR2, resid) |>
+ # write_csv(results_path)
+
+cat(sprintf("  Results CSV saved to: %s\n\n", results_path))
+
+cat("=======================================================\n")
+cat(" DONE\n")
+cat("=======================================================\n")
