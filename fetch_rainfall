@@ -1,0 +1,142 @@
+# =============================================================================
+# fetch_rainfall.R
+#
+# For each row in flood_noFlood.csv, fetches from the Open-Meteo Archive API:
+#   - hourly_rainfall_mm  : precipitation for the specific hour of the photo
+#   - daily_rainfall_mm   : total precipitation summed across all 24 hours of
+#                           the photo date
+#
+# Output: flood_noFlood_with_rainfall.csv  (original columns + 2 new columns)
+#
+# Dependencies: httr2, dplyr, readr
+#   Install with: install.packages(c("httr2", "dplyr", "readr"))
+# =============================================================================
+
+library(httr2)
+library(dplyr)
+library(readr)
+
+# ── 1. Load data ──────────────────────────────────────────────────────────────
+input_path  <- "flood_noFlood.csv"   # change path if needed
+output_path <- "flood_noFlood_with_rainfall.csv"
+
+# read_csv auto-parses photo_time as an hms <time> object (seconds since midnight)
+df <- read_csv(input_path, show_col_types = FALSE)
+
+# Extract hour directly from the hms object — no string parsing needed
+# as.integer() gives seconds since midnight; integer-divide by 3600 -> hour (0-23)
+df <- df |>
+  mutate(photo_hour = as.integer(photo_time) %/% 3600L)
+
+# Sanity check
+n_bad <- sum(is.na(df$photo_hour))
+if (n_bad > 0) {
+  cat(sprintf("WARNING: %d rows could not have their time parsed.\n", n_bad))
+  print(df |> filter(is.na(photo_hour)) |> select(photo_date, photo_time) |> head(5))
+} else {
+  cat(sprintf("All %d times parsed successfully. Sample hours: %s\n",
+              nrow(df), paste(head(df$photo_hour), collapse = ", ")))
+}
+
+# ── 2. Helper: call Open-Meteo archive API for one row ────────────────────────
+fetch_rainfall <- function(lat, lon, date_str, target_hour) {
+  
+  url <- "https://archive-api.open-meteo.com/v1/archive"
+  
+  resp <- request(url) |>
+    req_url_query(
+      latitude           = lat,
+      longitude          = lon,
+      start_date         = date_str,
+      end_date           = date_str,
+      hourly             = "precipitation",
+      timezone           = "America/New_York",   # matches photo timestamp timezone
+      precipitation_unit = "mm"
+    ) |>
+    req_retry(max_tries = 5, backoff = ~(0.2 * 2^.x)) |>
+    req_error(is_error = \(r) FALSE) |>
+    req_perform()
+  
+  if (resp_status(resp) != 200) {
+    warning(sprintf("API error %d for lat=%.4f lon=%.4f date=%s",
+                    resp_status(resp), lat, lon, date_str))
+    return(list(hourly_rainfall_mm = NA_real_, daily_rainfall_mm = NA_real_))
+  }
+  
+  body        <- resp_body_json(resp)
+  precip_vals <- unlist(body$hourly$precipitation)
+  
+  if (is.null(precip_vals) || length(precip_vals) == 0) {
+    warning(sprintf("No precipitation data for lat=%.4f lon=%.4f date=%s",
+                    lat, lon, date_str))
+    return(list(hourly_rainfall_mm = NA_real_, daily_rainfall_mm = NA_real_))
+  }
+  
+  # target_hour is 0-indexed; R vectors are 1-indexed
+  hour_idx   <- target_hour + 1L
+  hourly_val <- if (hour_idx >= 1L && hour_idx <= length(precip_vals))
+    precip_vals[[hour_idx]] else NA_real_
+  
+  daily_val <- sum(precip_vals, na.rm = TRUE)
+  
+  list(hourly_rainfall_mm = hourly_val, daily_rainfall_mm = daily_val)
+}
+
+# ── 3. Loop over rows ─────────────────────────────────────────────────────────
+cat(sprintf("Processing %d rows...\n", nrow(df)))
+
+hourly_rain <- numeric(nrow(df))
+daily_rain  <- numeric(nrow(df))
+
+for (i in seq_len(nrow(df))) {
+  row <- df[i, ]
+  
+  if (is.na(row$latitude) || is.na(row$longitude) ||
+      is.na(row$photo_date) || is.na(row$photo_hour)) {
+    warning(sprintf("Row %d: missing required fields, skipping.", i))
+    hourly_rain[i] <- NA_real_
+    daily_rain[i]  <- NA_real_
+    next
+  }
+  
+  result <- tryCatch(
+    fetch_rainfall(
+      lat         = row$latitude,
+      lon         = row$longitude,
+      date_str    = as.character(row$photo_date),
+      target_hour = row$photo_hour
+    ),
+    error = function(e) {
+      warning(sprintf("Row %d error: %s", i, conditionMessage(e)))
+      list(hourly_rainfall_mm = NA_real_, daily_rainfall_mm = NA_real_)
+    }
+  )
+  
+  hourly_rain[i] <- result$hourly_rainfall_mm
+  daily_rain[i]  <- result$daily_rainfall_mm
+  
+  if (i %% 10 == 0 || i == nrow(df))
+    cat(sprintf("  [%d / %d] lat=%.4f lon=%.4f date=%s hour=%d  ->  hourly=%.2f mm  daily=%.2f mm\n",
+                i, nrow(df),
+                row$latitude, row$longitude,
+                row$photo_date, row$photo_hour,
+                hourly_rain[i], daily_rain[i]))
+  
+  Sys.sleep(0.1)
+}
+
+# ── 4. Write output ───────────────────────────────────────────────────────────
+df_out <- df |>
+  mutate(
+    hourly_rainfall_mm = hourly_rain,
+    daily_rainfall_mm  = daily_rain
+  ) |>
+  select(-photo_hour)   # drop helper column
+
+write_csv(df_out, output_path)
+
+cat(sprintf("\nDone! Output written to: %s\n", output_path))
+cat(sprintf("Rows with valid hourly rainfall: %d / %d\n",
+            sum(!is.na(df_out$hourly_rainfall_mm)), nrow(df_out)))
+cat(sprintf("Rows with valid daily  rainfall: %d / %d\n",
+            sum(!is.na(df_out$daily_rainfall_mm)),  nrow(df_out)))
